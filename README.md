@@ -4,6 +4,11 @@
 **Developer: Ethan Muhlestein**
 
 
+<img width="863" height="770" alt="image" src="https://github.com/user-attachments/assets/bd5808ec-55c8-4099-9cb0-6daa475e67b3" />
+
+
+
+
 ## **Overview**
 The Automated Web-Based Relative Elevation Model Generator is a software tool created to streamline the creation of high-quality Relative Elevation Models (REMs) for any river in the Continuous United States and Alaska. This software encompasses a web-based user interface that allows users to select an area of interest on a map, download Digital Elevation Models (DEMs) and National Hydrography Dataset (NHD) river centerline data, and compute REMs based on the gathered data.
 
