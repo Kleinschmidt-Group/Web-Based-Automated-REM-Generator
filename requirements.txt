@@ -1,0 +1,52 @@
+# Python 3.11+ (tested with 3.11.5)
+# REM Processing Application Dependencies
+# Generated for: Kleinschmidt Associates - REM Software
+# Versions reflect actual working environment (trem)
+
+# Core Scientific Computing
+numpy==2.3.5
+scipy==1.16.3
+pandas==2.3.3
+numba==0.63.1
+xarray==2025.12.0
+
+# Geospatial System Libraries (MUST be installed via conda-forge first)
+# GDAL==3.10.3  # Install via conda, not pip
+
+# Geospatial Core Libraries
+geopandas==1.1.1
+rasterio==1.4.3
+rioxarray==0.20.0
+shapely==2.1.1
+pyproj==3.7.2
+affine==2.4.0
+pyogrio==0.11.0
+
+# Geospatial Data Acquisition
+py3dep==0.19.0
+pynhd==0.19.4
+
+# Visualization
+matplotlib==3.10.8
+matplotlib-inline==0.1.6
+pillow==12.0.0
+
+# Web Mapping
+folium==0.20.0
+branca==0.8.2
+contextily==1.7.0
+
+# Web Application Framework
+streamlit==1.52.1
+streamlit-folium==0.25.2
+
+# Parallel Processing & Utilities
+joblib==1.5.2
+psutil==5.9.0
+
+# HTTP & Networking
+requests==2.32.5
+requests-cache==1.2.1
+
+# Additional Documentation Tools
+numpydoc==1.9.0
