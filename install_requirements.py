@@ -51,11 +51,19 @@ def print_info(message):
 
 def check_conda():
     """Check if conda is available."""
+    # Check if we're in a conda environment
+    if os.environ.get('CONDA_DEFAULT_ENV') or os.environ.get('CONDA_PREFIX'):
+        env_name = os.environ.get('CONDA_DEFAULT_ENV', 'unknown')
+        print_success(f"Conda environment detected: {env_name}")
+        return True
+    
+    # Fallback: try to run conda command
     try:
         result = subprocess.run(['conda', '--version'],
                               capture_output=True,
                               text=True,
-                              check=True)
+                              check=True,
+                              shell=True)
         print_success(f"Conda detected: {result.stdout.strip()}")
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -302,3 +310,4 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
