@@ -7,9 +7,9 @@
 <img width="863" height="770" alt="image" src="https://github.com/user-attachments/assets/bd5808ec-55c8-4099-9cb0-6daa475e67b3" />
 
 
-"C:\Users\Ethan.Muhlestein\OneDrive - Kleinschmidt Associates\Documents\REM Github\Web-Based Automated REM Generator Getting Set Up-20260122_162746-Meeting Recording.mp4"
 
 
+A video on the Sotware can be found on the Kleinschmidt Q drive under "Internal Data", "Project_Templates", "Relative Elevation Model Generator". A video can be requested from the developer for non-Kleinschmidt employees.
 ## **Overview**
 The Automated Web-Based Relative Elevation Model Generator is a software tool created to streamline the creation of high-quality Relative Elevation Models (REMs) for any river in the Continuous United States and Alaska. This software encompasses a web-based user interface that allows users to select an area of interest on a map, download Digital Elevation Models (DEMs) and National Hydrography Dataset (NHD) river centerline data, and compute REMs based on the gathered data.
 
