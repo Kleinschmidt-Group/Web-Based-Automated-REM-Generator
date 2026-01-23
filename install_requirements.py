@@ -86,7 +86,7 @@ def install_conda_packages():
     print_info("Step 1: Installing GDAL (critical geospatial dependency)...")
     try:
         subprocess.run(['conda', 'install', '-c', 'conda-forge', '-y', 'gdal=3.10.3'],
-                      check=True, capture_output=True, text=True)
+                      check=True, capture_output=True, text=True, shell=True)
         print_success("GDAL installed successfully!")
     except subprocess.CalledProcessError as e:
         print_error("Failed to install GDAL - this is critical!")
@@ -144,7 +144,7 @@ def install_conda_packages():
 
     try:
         print(f"{Colors.OKCYAN}Running: conda install -c conda-forge -y {' '.join(conda_packages[:3])}...{Colors.ENDC}\n")
-        result = subprocess.run(cmd, check=True, text=True)
+        result = subprocess.run(cmd, check=True, text=True, shell=True)
         print_success("All conda packages installed successfully!")
         return True
     except subprocess.CalledProcessError as e:
@@ -162,7 +162,8 @@ def install_conda_packages_individually(packages):
             subprocess.run(['conda', 'install', '-c', 'conda-forge', '-y', package],
                          check=True,
                          capture_output=True,
-                         text=True)
+                         text=True,
+                         shell=True)
             print_success(f"{package} installed")
         except subprocess.CalledProcessError as e:
             print_error(f"Failed to install {package}")
@@ -310,4 +311,3 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
