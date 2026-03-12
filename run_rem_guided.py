@@ -772,21 +772,23 @@ def main():
     if use_defaults == 0:
         spacing = 20
         k_neighbors = 8
+        selected_engine = "hand"
         cpu_usage = 0.75  # Updated from 0.50 to 0.75 for better performance
         max_comp = None
         max_vis = 15.0
         color_ramp = "MagmaRamp"
         background = "hillshade"
         n_classes = 0
-        print("   Using defaults (75% CPU usage for good balance)")
+        print("   Using defaults (HAND engine, 75% CPU usage)")
     else:
         print("\nProcessing parameters:")
         print("\nParameter Explanations:")
         print("  • Spacing (m): Distance between river sampling points. Lower = more accurate but slower.")
-        print("  • K Neighbors (IDW): Number of nearby points for interpolation. Range: 4-300.")
-        print("      - Lower (4-8): Sharp detail, preserves terrain features")
-        print("      - Higher (20-300): Very smooth, averages out noise")
-        print("      - Default 8: Good balance for most cases")
+        print("  • Engine: Interpolation method.")
+        print("      - HAND (recommended): Follows D8 flow paths to river. No geometric artifacts.")
+        print("      - flow-weighted: Along-channel weighting. Fast, good for very large DEMs.")
+        print("      - idw: Legacy Inverse Distance Weighting.")
+        print("  • K Neighbors (IDW only): Number of nearby points for interpolation. Range: 4-300.")
         print("  • CPU Usage: Fraction of processor cores to use.")
         print("      - Low (0.25-0.50): Use while working. Keeps computer responsive.")
         print("      - Medium (0.60-0.75): Recommended. Good balance of speed and responsiveness.")
@@ -795,10 +797,22 @@ def main():
         print("  • Max REM (ft) - Comp: Maximum elevation to compute. Limits processing to floodplain.\n")
 
         spacing = int(get_input("  Spacing (meters)", default="20"))
-        k_neighbors = int(get_input("  K Neighbors (4-300)", default="8"))
 
-        # Validate k_neighbors range
-        if k_neighbors < 4 or k_neighbors > 300:
+        engine_input = get_input("  Engine [hand/flow-weighted/idw]", default="hand").strip().lower()
+        if engine_input in ("flow-weighted", "flow", "projection"):
+            selected_engine = "projection"
+        elif engine_input in ("idw", "scipy"):
+            selected_engine = "idw"
+        else:
+            selected_engine = "hand"
+        print(f"   Engine: {selected_engine}")
+
+        k_neighbors = 8
+        if selected_engine == "idw":
+            k_neighbors = int(get_input("  K Neighbors (4-300)", default="8"))
+
+        # Validate k_neighbors range (only relevant for IDW engine)
+        if selected_engine == "idw" and (k_neighbors < 4 or k_neighbors > 300):
             print(f"\n   WARNING: K Neighbors must be between 4 and 300. You entered: {k_neighbors}")
             k_neighbors = int(get_input("  K Neighbors (4-300)", default="8"))
 
@@ -1021,7 +1035,7 @@ def main():
         hillshade.create_hillshade_fast_qa(
             final_dem,
             hs_path,
-            downsample_factor=4,  # Balanced: good quality for QA and visualization
+            downsample_factor=1,  # Full resolution — no downsampling for QA
             z_factor=5.5
         )
 
@@ -1066,8 +1080,6 @@ def main():
         logger.info("PHASE 2: REM CALCULATION")
         logger.info("="*70)
 
-        # Force projection mode (matching app.py)
-        base_mode_auto = "projection"
         k_auto = int(k_neighbors)
 
         # Detect data source for adaptive cross-section width
@@ -1086,8 +1098,7 @@ def main():
                 max_value=max_m_comp,
                 threads=compute_threads,
                 idw_power=None,
-                base_mode=base_mode_auto,
-                engine="scipy",
+                engine=selected_engine,
                 data_source=data_source
             )
 
@@ -1173,8 +1184,8 @@ def main():
         }
 
         logger.info("Generating comprehensive statistics report...")
-        # Note: Ensure rem_utils.py has 'generate_full_stats_report'
-        utils.generate_full_stats_report(rem_tif, final_dem, report_config, stats_txt_path)
+        utils.generate_full_stats_report(rem_tif, final_dem, report_config, stats_txt_path,
+                                         river_shp=riv_rep_path)
         print(f"   Statistics Report generated: {os.path.basename(stats_txt_path)}")
 
     # Cleanup temporary files
