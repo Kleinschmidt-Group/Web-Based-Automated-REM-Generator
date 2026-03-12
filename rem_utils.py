@@ -635,7 +635,277 @@ from datetime import datetime
 
 # Calculate comprehensive REM and DEM statistics for quality assurance
 # Generates detailed report with DEM metadata, REM statistics, spatial coverage, and processing parameters
-def generate_full_stats_report(rem_path, dem_path, config_data, output_path):
+def _get_dem_acquisition_date(dem_path):
+    """
+    Return the actual LiDAR *collection* date range for the DEM.
+
+    Priority
+    --------
+    1. GDAL tag 'DEM_COLLECT_START' written during automatic download
+    2. USGS 3DEP LiDAR Availability Index (ArcGIS REST) — COLLECT_START /
+       COLLECT_END fields; these are the real flight dates.
+    3. TNM Access API metaUrl → FGDC metadata XML → <begdate>/<enddate>
+    4. TNM Access API sourceOriginDate (may be collection date for some products)
+    5. *** NOT used: publicationDate — that is when USGS published the product,
+       not when the LiDAR was flown, and can be years later. ***
+
+    Returns
+    -------
+    (start_date, end_date, source_label)
+      start_date  : 'YYYY-MM-DD' string (start of collection window)
+      end_date    : 'YYYY-MM-DD' string or None (end of window if multi-day)
+      source_label: human-readable provenance string
+    All three are None on complete failure.
+    """
+    import re
+    from datetime import datetime, timezone
+
+    def _yyyymmdd(s):
+        """Parse 'YYYYMMDD' or 'YYYY-MM-DD' or 'YYYY/MM/DD' → 'YYYY-MM-DD'."""
+        if not s:
+            return None
+        s = str(s).strip()
+        m = re.search(r'(\d{4})[-/]?(\d{2})[-/]?(\d{2})', s)
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+
+    def _ms_to_date(ms):
+        """ArcGIS REST epoch-milliseconds → 'YYYY-MM-DD'."""
+        try:
+            return datetime.fromtimestamp(
+                int(ms) / 1000, tz=timezone.utc
+            ).strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    # ── 1. GDAL tag ────────────────────────────────────────────────────────
+    bounds = None
+    crs    = None
+    try:
+        with rasterio.open(dem_path) as src:
+            tags   = src.tags()
+            bounds = src.bounds
+            crs    = src.crs
+        start = _yyyymmdd(tags.get("DEM_COLLECT_START", ""))
+        end   = _yyyymmdd(tags.get("DEM_COLLECT_END",   ""))
+        if start:
+            return start, end, "GDAL tag (DEM_COLLECT_START)"
+    except Exception:
+        pass  # If we can't open the DEM, bounds/crs stay None — handled below
+
+    if bounds is None:
+        return None, None, None  # Cannot determine DEM extent for API queries
+
+    # ── Convert DEM bounds → WGS84 for API queries ─────────────────────────
+    try:
+        import requests
+        from pyproj import Transformer
+
+        if not crs.is_geographic:
+            tf = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+            west, south = tf.transform(bounds.left,  bounds.bottom)
+            east, north = tf.transform(bounds.right, bounds.top)
+        else:
+            west, south, east, north = (bounds.left, bounds.bottom,
+                                        bounds.right, bounds.top)
+    except Exception:
+        return None, None, None
+
+    # ── 2. 3DEP LiDAR Availability Index (best source) ────────────────────
+    try:
+        resp = requests.get(
+            "https://index.nationalmap.gov/arcgis/rest/services/"
+            "3DEPElevationIndex/MapServer/4/query",
+            params={
+                "geometry":     f"{west},{south},{east},{north}",
+                "geometryType": "esriGeometryEnvelope",
+                "inSR":         "4326",
+                "spatialRel":   "esriSpatialRelIntersects",
+                "outFields":    "COLLECT_START,COLLECT_END,WORKPACKAGENAME",
+                "returnGeometry": "false",
+                "f":            "json",
+            },
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            features = resp.json().get("features", [])
+            if features:
+                attr  = features[0]["attributes"]
+                start = _ms_to_date(attr.get("COLLECT_START"))
+                end   = _ms_to_date(attr.get("COLLECT_END"))
+                if start:
+                    return start, end, "3DEP LiDAR Index (actual flight dates)"
+    except Exception:
+        pass
+
+    # ── 3. TNM API → metaUrl → FGDC XML ────────────────────────────────────
+    try:
+        import xml.etree.ElementTree as ET
+
+        tnm = requests.get(
+            "https://tnmaccess.nationalmap.gov/api/v1/products",
+            params={"bbox": f"{west},{south},{east},{north}",
+                    "prodFormats": "GeoTIFF", "max": 5},
+            timeout=15,
+        )
+        if tnm.status_code == 200:
+            for item in tnm.json().get("items", []):
+                meta_url = item.get("metaUrl", "")
+                if not meta_url:
+                    continue
+                try:
+                    xml_resp = requests.get(meta_url, timeout=15)
+                    if xml_resp.status_code != 200:
+                        continue
+                    root = ET.fromstring(xml_resp.text)
+                    ns   = {"fgdc": ""}   # FGDC has no namespace
+                    # Search for begdate/enddate anywhere in the tree
+                    beg = root.find(".//begdate")
+                    end_el = root.find(".//enddate")
+                    sng = root.find(".//caldate")
+                    start = _yyyymmdd((beg.text if beg is not None else None)
+                                      or (sng.text if sng is not None else None))
+                    end   = _yyyymmdd(end_el.text if end_el is not None else None)
+                    if start:
+                        return start, end, "FGDC metadata XML (actual collection dates)"
+                except Exception:
+                    continue
+
+            # ── 4. sourceOriginDate from TNM (may be collection date) ──────
+            for item in tnm.json().get("items", []):
+                sod = _yyyymmdd(item.get("sourceOriginDate", ""))
+                if sod:
+                    return sod, None, "TNM sourceOriginDate (may approximate collection)"
+    except Exception:
+        pass
+
+    return None, None, None
+
+
+def _get_usgs_flow_on_date(river_shp, date_str, search_deg=0.75):
+    """
+    Find the nearest USGS stream gauge to the river and return mean daily
+    discharge (CFS) for the given date.
+
+    Returns a dict with keys:
+        site_no, station_name, distance_km, cfs, flow_date, url
+    or None if no data could be retrieved.
+
+    date_str: ISO format 'YYYY-MM-DD'
+    """
+    try:
+        import requests
+        import math
+
+        # ── River centroid in WGS84 ────────────────────────────────────────
+        rivers = gpd.read_file(river_shp).to_crs("EPSG:4326")
+        centroid = rivers.geometry.union_all().centroid if hasattr(
+            rivers.geometry, "union_all") else rivers.geometry.unary_union.centroid
+        lon, lat = centroid.x, centroid.y
+
+        # ── 1. Find nearby USGS stream gauges ─────────────────────────────
+        site_resp = requests.get(
+            "https://waterservices.usgs.gov/nwis/site/",
+            params={
+                "format":       "rdb",
+                "bBox":         f"{lon-search_deg},{lat-search_deg},"
+                                f"{lon+search_deg},{lat+search_deg}",
+                "siteType":     "ST",
+                "hasDataTypeCd":"dv",
+                "parameterCd":  "00060",
+                "siteStatus":   "all",
+            },
+            timeout=20,
+        )
+        if site_resp.status_code != 200:
+            return None
+
+        # Parse RDB (skip comment lines and the format-descriptor line)
+        lines = [l for l in site_resp.text.splitlines()
+                 if not l.startswith("#") and l.strip()]
+        if len(lines) < 3:
+            return None
+
+        headers = lines[0].split("\t")
+        # lines[1] is the RDB format row — skip it
+        gauges = []
+        for row in lines[2:]:
+            cols = row.split("\t")
+            if len(cols) < len(headers):
+                continue
+            rec = dict(zip(headers, cols))
+            try:
+                g_lat = float(rec.get("dec_lat_va") or rec.get("lat_va", "0"))
+                g_lon = float(rec.get("dec_long_va") or rec.get("long_va", "0"))
+            except ValueError:
+                continue
+            # Great-circle distance (km)
+            dlat = math.radians(g_lat - lat)
+            dlon = math.radians(g_lon - lon)
+            a = (math.sin(dlat/2)**2 +
+                 math.cos(math.radians(lat)) * math.cos(math.radians(g_lat)) *
+                 math.sin(dlon/2)**2)
+            dist_km = 6371 * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+            gauges.append({
+                "site_no":      rec.get("site_no", "").strip(),
+                "station_name": rec.get("station_nm", "").strip(),
+                "lat": g_lat, "lon": g_lon,
+                "dist_km": dist_km,
+            })
+
+        if not gauges:
+            return None
+
+        gauges.sort(key=lambda g: g["dist_km"])
+        nearest = gauges[0]
+
+        # ── 2. Query mean daily discharge on the DEM date ─────────────────
+        flow_resp = requests.get(
+            "https://waterservices.usgs.gov/nwis/dv/",
+            params={
+                "format":      "json",
+                "sites":       nearest["site_no"],
+                "startDT":     date_str,
+                "endDT":       date_str,
+                "parameterCd": "00060",   # discharge
+                "statCd":      "00003",   # mean daily
+            },
+            timeout=20,
+        )
+        if flow_resp.status_code != 200:
+            return None
+
+        # Dig into NWIS JSON response
+        ts_list = (flow_resp.json()
+                   .get("value", {})
+                   .get("timeSeries", []))
+        cfs = None
+        flow_date_actual = date_str
+        for ts in ts_list:
+            values = ts.get("values", [{}])[0].get("value", [])
+            if values:
+                raw = values[0].get("value")
+                try:
+                    cfs = float(raw)
+                    flow_date_actual = values[0].get("dateTime", date_str)[:10]
+                except (TypeError, ValueError):
+                    pass
+                break
+
+        return {
+            "site_no":      nearest["site_no"],
+            "station_name": nearest["station_name"],
+            "distance_km":  round(nearest["dist_km"], 1),
+            "cfs":          cfs,
+            "flow_date":    flow_date_actual,
+            "url": f"https://waterdata.usgs.gov/monitoring-location/{nearest['site_no']}/",
+        }
+
+    except Exception:
+        return None
+
+
+def generate_full_stats_report(rem_path, dem_path, config_data, output_path,
+                                river_shp=None):
 
     # REM Statistics
 
@@ -731,12 +1001,84 @@ def generate_full_stats_report(rem_path, dem_path, config_data, output_path):
 
     now = datetime.now()
 
+    # ── Look up DEM acquisition date and river conditions (best-effort) ─────
+    from datetime import datetime as _dt, timedelta as _td
+
+    collect_start, collect_end, date_source = _get_dem_acquisition_date(dem_path)
+    flow_info  = None
+    query_date = None
+
+    if collect_start and river_shp and os.path.exists(river_shp):
+        if collect_end and collect_end != collect_start:
+            # Use midpoint of collection window for flow query
+            try:
+                d0 = _dt.strptime(collect_start, "%Y-%m-%d")
+                d1 = _dt.strptime(collect_end,   "%Y-%m-%d")
+                query_date = (d0 + (d1 - d0) / 2).strftime("%Y-%m-%d")
+            except Exception:
+                query_date = collect_start
+        else:
+            query_date = collect_start
+        flow_info = _get_usgs_flow_on_date(river_shp, query_date)
+
     with open(output_path, "w", encoding='utf-8') as f:
         f.write("=" * 70 + "\n")
         f.write("  REM PROJECT REPORT - ANALYSIS & QUALITY METRICS\n")
         f.write("=" * 70 + "\n")
         f.write(f"Generated: {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Software: Automated REM Generator v1.0\n\n")
+
+        # =====================================================================
+        # SECTION 0: SURVEY CONDITIONS (DEM DATE + RIVER FLOW)
+        # =====================================================================
+        f.write("─" * 70 + "\n")
+        f.write("SECTION 0: SURVEY CONDITIONS AT TIME OF DEM ACQUISITION\n")
+        f.write("─" * 70 + "\n\n")
+
+        f.write("LiDAR Collection Date:\n")
+        if collect_start:
+            f.write(f"  Collection Start:          {collect_start}\n")
+            if collect_end and collect_end != collect_start:
+                f.write(f"  Collection End:            {collect_end}\n")
+            f.write(f"  Source:                    {date_source}\n")
+            if "approx" in (date_source or "").lower() or "origin" in (date_source or "").lower():
+                f.write(f"  Note:                      Approximate — verify against project\n")
+                f.write(f"                             metadata if precision is required.\n")
+        else:
+            f.write(f"  Collection Date:           Not available\n")
+            f.write(f"  Note:                      Could not retrieve actual LiDAR flight\n")
+            f.write(f"                             dates from 3DEP index or FGDC metadata.\n")
+        f.write("\n")
+
+        f.write("River Flow Conditions (USGS NWIS):\n")
+        if flow_info:
+            cfs_val = flow_info.get("cfs")
+            if collect_end and collect_end != collect_start and query_date:
+                f.write(f"  Flow Query Date:           {query_date} "
+                        f"(midpoint of collection window)\n")
+            elif query_date:
+                f.write(f"  Flow Query Date:           {query_date}\n")
+            if cfs_val is not None:
+                f.write(f"  Mean Daily Discharge:      {cfs_val:,.0f} CFS\n")
+            else:
+                f.write(f"  Mean Daily Discharge:      No record found for this date\n")
+            f.write(f"  USGS Gauge Station:        {flow_info.get('station_name', 'N/A')}\n")
+            f.write(f"  Gauge ID:                  {flow_info.get('site_no', 'N/A')}\n")
+            f.write(f"  Gauge Distance to River:   {flow_info.get('distance_km', 'N/A')} km\n")
+            f.write(f"  Gauge URL:                 {flow_info.get('url', 'N/A')}\n")
+            if cfs_val is not None:
+                f.write(f"  Interpretation:            This REM models terrain relative to the\n")
+                f.write(f"                             river surface when the LiDAR was flown.\n")
+                if collect_end and collect_end != collect_start:
+                    f.write(f"                             Flow varies across the collection window\n")
+                    f.write(f"                             ({collect_start} – {collect_end});\n")
+                    f.write(f"                             midpoint value used as representative.\n")
+        elif not collect_start:
+            f.write(f"  Status:                    Skipped (LiDAR collection date unavailable)\n")
+        else:
+            f.write(f"  Status:                    Could not retrieve from USGS NWIS\n")
+            f.write(f"                             (network error or no gauge found nearby)\n")
+        f.write("\n")
 
         # =====================================================================
         # SECTION 1: DEM SOURCE METADATA
