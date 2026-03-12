@@ -15,6 +15,7 @@ import xarray as xr
 from numba import njit, float64, prange
 from scipy.spatial import KDTree
 from scipy.signal import savgol_filter
+from scipy.ndimage import gaussian_filter1d
 from shapely.geometry import LineString, MultiLineString, GeometryCollection
 from shapely import ops
 import gc
@@ -339,19 +340,259 @@ def _engine_scipy_kdtree(tile_coords, tree, elevations, k, power, workers, max_d
 def process_tile_interpolation(engine, tile_coords, tree=None, elevations=None, k=8, power=2.0, workers=1, max_dist=5000.0, **kwargs):
     return _engine_scipy_kdtree(tile_coords, tree, elevations, k, power, workers, max_dist)
 
-def generate_base_surface_memmap(dem_path, dem_transform, shape, pts_gdf, tile_size=2048, k_neighbors=50, power=2.0, workers=None, temp_dir=".", max_dist=5000.0, absolute_cutoff=None, **kwargs):
+
+def _engine_perpendicular_projection(tile_coords, tree, river_coords, river_s, river_elevations, max_dist=5000.0):
+    """
+    For each pixel, project perpendicularly onto the river centerline and
+    interpolate elevation from the 1D smoothed profile.
+
+    Seam-free blending: instead of hard-assigning each pixel to one segment
+    (which creates visible Voronoi boundary lines), we find the two closest
+    segment projections and blend their elevations with inverse-distance
+    weights. Pixels deep inside a zone get ~100% from the nearest segment;
+    pixels near a boundary get a smooth blend — no visible lines.
+
+    Using k=3 nearest points covers 6 candidate segments per pixel, ensuring
+    the correct segment is always found even near curved river bends.
+    """
+    n_river = len(river_coords)
+    px = tile_coords[:, 0]
+    py = tile_coords[:, 1]
+    n_pix = len(px)
+
+    # k=3 → up to 6 candidate segments; catches the correct segment even near
+    # Voronoi boundaries where k=2 could miss the true closest segment
+    k_query = min(3, n_river)
+    dists, idxs = tree.query(tile_coords, k=k_query, distance_upper_bound=max_dist, workers=1)
+
+    if dists.ndim == 1:
+        dists = dists[:, None]
+        idxs  = idxs[:, None]
+
+    no_neighbor  = dists[:, 0] >= max_dist
+    valid_idxs   = np.where(idxs >= n_river, -1, idxs)  # -1 = invalid slot
+
+    def _project_segment(a_idx, b_idx):
+        """Vectorised projection; returns (s_proj, perp_dist_sq)."""
+        valid  = (a_idx >= 0) & (b_idx >= 0) & (b_idx < n_river)
+        a_safe = np.clip(a_idx, 0, n_river - 1)
+        b_safe = np.clip(b_idx, 0, n_river - 1)
+
+        ax = river_coords[a_safe, 0];  ay = river_coords[a_safe, 1]
+        bx = river_coords[b_safe, 0];  by = river_coords[b_safe, 1]
+
+        dx = bx - ax;  dy = by - ay
+        seg_len_sq = np.where(dx*dx + dy*dy < 1e-10, 1e-10, dx*dx + dy*dy)
+
+        vx = px - ax;  vy = py - ay
+        t  = np.clip((vx*dx + vy*dy) / seg_len_sq, 0.0, 1.0)
+
+        proj_x = ax + t*dx;  proj_y = ay + t*dy
+        perp_d2 = (px - proj_x)**2 + (py - proj_y)**2
+        s_proj  = river_s[a_safe] + t * (river_s[b_safe] - river_s[a_safe])
+
+        perp_d2 = np.where(valid, perp_d2, np.inf)
+        return s_proj, perp_d2
+
+    # Track the two closest segment projections (best-1 and best-2) for blending
+    best1_s = np.zeros(n_pix, dtype=np.float64)
+    best2_s = np.zeros(n_pix, dtype=np.float64)
+    best1_d = np.full(n_pix, np.inf)
+    best2_d = np.full(n_pix, np.inf)
+
+    for ki in range(k_query):
+        j       = valid_idxs[:, ki]
+        valid_j = j >= 0
+        j_safe  = np.where(valid_j, j, 0)
+
+        for a_off, b_off in ((-1, 0), (0, 1)):
+            s_seg, d_seg = _project_segment(j_safe + a_off, j_safe + b_off)
+            d_seg = np.where(valid_j, d_seg, np.inf)
+
+            # Is this candidate better than current best-1?
+            to_1 = d_seg < best1_d
+            # Not better than best-1 but better than best-2?
+            to_2 = (~to_1) & (d_seg < best2_d)
+
+            # Demote best-1 → best-2 where a new best-1 is found
+            best2_s = np.where(to_1, best1_s, np.where(to_2, s_seg, best2_s))
+            best2_d = np.where(to_1, best1_d, np.where(to_2, d_seg, best2_d))
+            best1_s = np.where(to_1, s_seg,   best1_s)
+            best1_d = np.where(to_1, d_seg,   best1_d)
+
+    # Elevations for the two best projections
+    e1 = np.interp(best1_s, river_s, river_elevations).astype(np.float32)
+    e2 = np.interp(best2_s, river_s, river_elevations).astype(np.float32)
+
+    # Inverse-distance blend (actual distance, not squared)
+    d1 = np.sqrt(np.maximum(best1_d, 0.0)) + 1e-6
+    d2 = np.sqrt(np.maximum(best2_d, 0.0)) + 1e-6
+    w1 = 1.0 / d1
+    w2 = 1.0 / d2
+
+    # If no second segment was found (river start/end), fall back to e1 only
+    has_second = best2_d < np.inf
+    z_out = np.where(has_second,
+                     (w1 * e1 + w2 * e2) / (w1 + w2),
+                     e1).astype(np.float32)
+
+    z_out = np.where(no_neighbor, np.nan, z_out)
+    return z_out
+
+def _smooth_base_surface_inplace(memmap, sigma_pixels, strip_size=1024):
+    """
+    Separable NaN-safe Gaussian blur applied to the base surface in-place.
+
+    Eliminates the faint perpendicular banding caused by discrete cross-section
+    zones in the perpendicular projection method.  Uses two 1-D passes
+    (horizontal then vertical) so no full-array copy is ever needed.
+
+    Strip processing keeps peak memory to (strip_size × max_dim × 4) bytes.
+    """
+    rows, cols = memmap.shape
+    if sigma_pixels < 0.5:
+        return
+
+    log_step(f"Smoothing base surface (sigma={sigma_pixels:.1f} px) to remove band artifacts...")
+
+    def _nan_gauss_1d(arr, sigma, axis):
+        """Weighted convolution that ignores NaN cells."""
+        nan_mask = ~np.isfinite(arr)
+        filled  = np.where(nan_mask, 0.0, arr).astype(np.float64)
+        weights = np.where(nan_mask, 0.0, 1.0).astype(np.float64)
+        b_data  = gaussian_filter1d(filled,  sigma, axis=axis, mode='nearest')
+        b_wt    = gaussian_filter1d(weights, sigma, axis=axis, mode='nearest')
+        result  = np.where(b_wt > 1e-6, b_data / b_wt, np.nan)
+        return result.astype(np.float32)
+
+    # Pass 1 — horizontal (axis=1): rows are independent → row-strips, no overlap
+    for r0 in range(0, rows, strip_size):
+        r1 = min(rows, r0 + strip_size)
+        strip = memmap[r0:r1, :].copy()
+        memmap[r0:r1, :] = _nan_gauss_1d(strip, sigma_pixels, axis=1)
+    memmap.flush()
+
+    # Pass 2 — vertical (axis=0): columns are independent → col-strips, no overlap
+    for c0 in range(0, cols, strip_size):
+        c1 = min(cols, c0 + strip_size)
+        strip = memmap[:, c0:c1].copy()
+        memmap[:, c0:c1] = _nan_gauss_1d(strip, sigma_pixels, axis=0)
+    memmap.flush()
+
+    log_step("Base surface smoothing complete.")
+
+
+def _engine_flow_weighted(tile_coords, tree, river_coords, tangents, river_elevations, spacing, k=8, max_dist=5000.0):
+    """
+    Flow-weighted interpolation: weights each river point by the inverse of its
+    along-channel distance to the pixel (i.e. how far up/downstream the pixel is
+    from that cross-section), rather than by Euclidean distance.
+
+    Why this eliminates bend artifacts
+    -----------------------------------
+    Perpendicular projection hard-assigns every pixel to its closest segment.
+    At a meander the Voronoi boundary between two adjacent segments cuts across
+    the floodplain at an angle — producing a visible seam.
+
+    Here, every nearby river point contributes, weighted by
+        w_j = 1 / (along_j^2 + epsilon)
+    where  along_j = dot( pixel - river_j, tangent_j )
+    is the signed along-channel offset.  When a pixel sits exactly across from
+    cross-section j, along_j ≈ 0 → weight is 1/epsilon (maximum).  As the pixel
+    moves upstream/downstream from j, the weight drops continuously.
+
+    Because tangent_j rotates gradually around a bend, so do the weights — the
+    transition is smooth everywhere, with no hard boundaries.
+
+    epsilon = (spacing/2)^2 sets the blending half-width to half the sample
+    spacing: a pixel must be within ~spacing/2 m along-channel before it gets
+    appreciable weight from that section.
+    """
+    n_river = len(river_coords)
+    n_pix   = len(tile_coords)
+
+    k_query = min(k, n_river)
+    dists, idxs = tree.query(tile_coords, k=k_query, distance_upper_bound=max_dist, workers=1)
+
+    if dists.ndim == 1:
+        dists = dists[:, None]
+        idxs  = idxs[:, None]
+
+    no_neighbor = dists[:, 0] >= max_dist
+
+    # epsilon controls the along-channel blending width.
+    # A pixel at the midpoint between two cross-sections (along_dist = spacing/2) has:
+    #   weight_ratio = epsilon / ((spacing/2)^2 + epsilon)
+    # Setting epsilon = spacing^2 gives ~80% at the midpoint — smooth enough to eliminate
+    # visible zone boundaries at any spacing, while still correctly weighting by position.
+    # Using (spacing/2)^2 gave only 50% at the midpoint — too sharp at tight spacings.
+    epsilon = float(spacing) ** 2
+
+    px = tile_coords[:, 0]
+    py = tile_coords[:, 1]
+
+    z_acc = np.zeros(n_pix, dtype=np.float64)
+    w_acc = np.zeros(n_pix, dtype=np.float64)
+
+    for ki in range(k_query):
+        j       = idxs[:, ki]
+        valid   = j < n_river
+        j_safe  = np.where(valid, j, 0)
+
+        # Vector from river point j → pixel
+        vx = px - river_coords[j_safe, 0]
+        vy = py - river_coords[j_safe, 1]
+
+        # Along-channel component at cross-section j
+        tx = tangents[j_safe, 0]
+        ty = tangents[j_safe, 1]
+        along = vx * tx + vy * ty   # signed; 0 = directly across from section j
+
+        # Weight peaks when pixel is directly across from this section
+        w = np.where(valid, 1.0 / (along * along + epsilon), 0.0)
+
+        elev = river_elevations[j_safe].astype(np.float64)
+        z_acc += w * elev
+        w_acc += w
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z_out = np.where(w_acc > 0.0, z_acc / w_acc, np.nan)
+
+    z_out = np.where(no_neighbor, np.nan, z_out)
+    return z_out.astype(np.float32)
+
+
+def generate_base_surface_memmap(dem_path, dem_transform, shape, pts_gdf, tile_size=2048, k_neighbors=50, power=2.0, workers=None, temp_dir=".", max_dist=5000.0, absolute_cutoff=None, engine="projection", river_s=None, spacing=20, tangents=None, **kwargs):
     rows, cols = shape
     base_filename = os.path.join(temp_dir, "rem_base_surface.dat")
     out = np.memmap(base_filename, dtype='float32', mode='w+', shape=(rows, cols))
     
     a, b, c, d, e, f = dem_transform.a, dem_transform.b, dem_transform.c, dem_transform.d, dem_transform.e, dem_transform.f
     
-    log_step("Building KDTree for SciPy engine...")
+    use_flow_weighted   = (engine == "projection") and (tangents is not None)
+    use_projection      = (engine == "projection") and (river_s is not None) and not use_flow_weighted
+
+    if use_flow_weighted:
+        engine_label = "Flow-Weighted (smooth, bend-safe)"
+    elif use_projection:
+        engine_label = "Perpendicular Projection (legacy)"
+    else:
+        engine_label = "IDW (SciPy KDTree)"
+    log_step(f"Building KDTree — Engine: {engine_label}...")
+
     river_coords = np.array([(p.x, p.y) for p in pts_gdf.geometry], dtype="float64")
     tree = KDTree(river_coords, leafsize=16)
     river_vals = pts_gdf["elevation"].values
-    
-    log_step(f"Starting Interpolation. Tiles: {tile_size}px. Max Search: {max_dist}m. Z-Cutoff: {absolute_cutoff}m")
+
+    # Projection / flow-weighted engine needs the s array
+    if use_projection:
+        river_s_arr = np.asarray(river_s, dtype="float64")
+
+    # Flow-weighted engine needs the tangent array
+    if use_flow_weighted:
+        tangents_arr = np.asarray(tangents, dtype="float64")
+
+    log_step(f"Starting Interpolation. Engine: {engine_label}. Tiles: {tile_size}px. Max Search: {max_dist}m. Z-Cutoff: {absolute_cutoff}m")
     
     total_tiles = (int(np.ceil(rows/tile_size))) * (int(np.ceil(cols/tile_size)))
     tile_count = 0
@@ -406,7 +647,17 @@ def generate_base_surface_memmap(dem_path, dem_transform, shape, pts_gdf, tile_s
                 
                 # Run Engine on subset
                 if tile_coords.shape[0] > 0:
-                    z_subset = process_tile_interpolation("scipy", tile_coords, tree=tree, elevations=river_vals, k=int(k_neighbors), power=power, workers=workers, max_dist=max_dist)
+                    if use_flow_weighted:
+                        z_subset = _engine_flow_weighted(
+                            tile_coords, tree, river_coords, tangents_arr, river_vals,
+                            spacing=spacing, k=8, max_dist=max_dist
+                        )
+                    elif use_projection:
+                        z_subset = _engine_perpendicular_projection(
+                            tile_coords, tree, river_coords, river_s_arr, river_vals, max_dist=max_dist
+                        )
+                    else:
+                        z_subset = process_tile_interpolation("scipy", tile_coords, tree=tree, elevations=river_vals, k=int(k_neighbors), power=power, workers=workers, max_dist=max_dist)
                     
                     # Map back to full tile
                     full_tile = np.full((h, w), np.nan, dtype=np.float32)
@@ -422,7 +673,248 @@ def generate_base_surface_memmap(dem_path, dem_transform, shape, pts_gdf, tile_s
     out.flush()
     if total_pixels_processed > 0:
         log_step(f"Interpolation Done. Skipped {skipped_pixels/1e6:.1f}M / {total_pixels_processed/1e6:.1f}M pixels ({skipped_pixels/total_pixels_processed*100:.1f}%) due to Z-Filter.")
-    
+
+    # Flow-weighted engine is smooth by construction — no blur needed.
+    # Legacy perpendicular projection produces discrete cross-section bands; blur
+    # those out with two Gaussian passes.
+    if use_projection and not use_flow_weighted:
+        pixel_size = abs(float(dem_transform.a))
+        sigma_px   = float(spacing) / max(pixel_size, 1e-6)
+        sigma_px   = max(3.0, min(sigma_px, 60.0))
+        log_step(f"Base surface smoothing (legacy projection): sigma={sigma_px:.1f} px ({sigma_px * pixel_size:.1f} m), 2 passes")
+        _smooth_base_surface_inplace(out, sigma_px)
+        _smooth_base_surface_inplace(out, sigma_px)
+
+    return out, base_filename
+
+
+# HAND Engine
+
+def generate_base_surface_hand(dem_path, dem_transform, dem_shape, pts_gdf,
+                                temp_dir=".", spacing=20, max_dist=5000.0,
+                                absolute_cutoff=None, **kwargs):
+    """
+    HAND (Height Above Nearest Drainage) base surface.
+
+    For each terrain pixel, follows the D8 flow network downhill until it
+    reaches a river cell, then assigns the smoothed river profile elevation
+    of that cell as the base elevation.
+
+    This completely eliminates Voronoi seams and bend artifacts because the
+    assignment follows actual water-flow paths, not geometric distance.
+    River-bend pixels naturally drain to the correct reach of the river —
+    no perpendicular lines, no zone boundaries.
+
+    Pipeline
+    --------
+    1. Condition DEM: pit-fill → fill depressions → resolve flats (pysheds)
+    2. D8 flow direction
+    3. Rasterize river centerline (buffered to ensure pixel coverage)
+    4. Path-doubling from river cells upstream → each pixel learns which
+       river cell it ultimately drains to (O(N · log D), fully vectorized)
+    5. Look up smoothed profile elevation at that river cell
+    6. Write to memmap
+
+    Requires pysheds:  pip install pysheds
+    """
+    try:
+        from pysheds.grid import Grid
+    except ImportError:
+        raise ImportError(
+            "pysheds is required for the HAND engine.\n"
+            "Install with:  pip install pysheds"
+        )
+
+    from rasterio.features import rasterize as rio_rasterize
+    from scipy.ndimage import distance_transform_edt
+    from shapely.geometry import Point
+    from shapely.geometry import mapping as shp_mapping
+
+    rows, cols = dem_shape
+    pixel_size = abs(float(dem_transform.a))
+    n = rows * cols
+
+    # Memory estimate (pysheds holds ~3 float32 copies of the DEM during conditioning)
+    mem_gb = (n * 4 * 4) / 1e9
+    log_step(f"HAND: DEM {cols}×{rows} px — estimated peak RAM ~{mem_gb:.1f} GB")
+    if psutil is not None:
+        avail_gb = psutil.virtual_memory().available / 1e9
+        if mem_gb > avail_gb * 0.75:
+            log_step(
+                f"WARNING: Estimated RAM ({mem_gb:.1f} GB) is close to available "
+                f"({avail_gb:.1f} GB). Consider the Flow-Weighted engine for very large DEMs."
+            )
+
+    # ── Step 1: Condition DEM ──────────────────────────────────────────────
+    log_step("HAND: Conditioning DEM (pit-fill → depressions → flats)...")
+    grid     = Grid.from_raster(dem_path)
+    dem_data = grid.read_raster(dem_path)
+    conditioned = grid.resolve_flats(
+        grid.fill_depressions(
+            grid.fill_pits(dem_data)
+        )
+    )
+
+    # ── Step 2: D8 flow direction ──────────────────────────────────────────
+    log_step("HAND: Computing D8 flow direction...")
+    fdir     = grid.flowdir(conditioned)
+    fdir_arr = np.array(fdir, dtype=np.int32).ravel()
+    del conditioned, fdir, dem_data
+    gc.collect()
+
+    # ── Step 3: Build downstream flat-index array (vectorised) ────────────
+    log_step("HAND: Building vectorised flow graph...")
+
+    # pysheds default ESRI dirmap: N=64, NE=128, E=1, SE=2, S=4, SW=8, W=16, NW=32
+    D8_OFFSETS = {
+        64:  (-1,  0),   # N
+        128: (-1,  1),   # NE
+        1:   ( 0,  1),   # E
+        2:   ( 1,  1),   # SE
+        4:   ( 1,  0),   # S
+        8:   ( 1, -1),   # SW
+        16:  ( 0, -1),   # W
+        32:  (-1, -1),   # NW
+    }
+
+    flat_idx  = np.arange(n, dtype=np.int32)
+    row_of    = flat_idx // cols
+    col_of    = flat_idx % cols
+    downstream = np.full(n, -1, dtype=np.int32)
+
+    for d_val, (dr, dc) in D8_OFFSETS.items():
+        mask = fdir_arr == d_val
+        if not np.any(mask):
+            continue
+        nr = row_of[mask] + dr
+        nc = col_of[mask] + dc
+        ok = (nr >= 0) & (nr < rows) & (nc >= 0) & (nc < cols)
+        src = flat_idx[mask][ok]
+        downstream[src] = (nr[ok] * cols + nc[ok]).astype(np.int32)
+
+    del fdir_arr, flat_idx, row_of, col_of
+    gc.collect()
+
+    # ── Step 4: Rasterise river centerline ────────────────────────────────
+    log_step("HAND: Rasterising river centerline...")
+    buf_m = max(pixel_size * 2.0, spacing * 0.5)
+    river_shapes = [
+        (shp_mapping(Point(p.x, p.y).buffer(buf_m)), 1)
+        for p in pts_gdf.geometry
+    ]
+    is_river_2d = rio_rasterize(
+        river_shapes, out_shape=(rows, cols),
+        transform=dem_transform, fill=0, dtype='uint8'
+    ).astype(bool)
+    is_river = is_river_2d.ravel()
+
+    # ── Step 5: Path-doubling — find nearest river cell for every pixel ───
+    # Each pixel starts with `parent` = its downstream neighbour.
+    # River cells point to themselves (they ARE the target).
+    # Non-river sinks also point to themselves (dead end; will be excluded).
+    # Repeated application of  parent = parent[parent]  halves path lengths
+    # each step → converges in O(log D) iterations for max path depth D.
+    log_step("HAND: Tracing flow paths to nearest river cell (path-doubling)...")
+
+    parent = downstream.copy()
+
+    river_cells = np.where(is_river)[0].astype(np.int32)
+    parent[river_cells] = river_cells          # river cells are their own root
+
+    sink_mask = (parent < 0) & ~is_river
+    parent[np.where(sink_mask)[0]] = np.where(sink_mask)[0].astype(np.int32)
+
+    max_iters = max(25, int(np.ceil(np.log2(max(rows, cols) + 1))) + 6)
+    for i in range(max_iters):
+        p_safe   = np.where(parent >= 0, parent, 0).astype(np.int64)
+        new_par  = parent[p_safe].astype(np.int32)
+        if np.array_equal(new_par, parent):
+            log_step(f"HAND: Converged in {i + 1} iterations.")
+            break
+        parent = new_par
+        if (i + 1) % 5 == 0:
+            log_step(f"HAND: Path-doubling iteration {i + 1}/{max_iters}...")
+    else:
+        log_step("HAND: WARNING — path-doubling reached max iterations. "
+                 "Some headwater pixels may be unlabelled.")
+
+    # ── Step 6: Assign smoothed profile elevations ────────────────────────
+    log_step("HAND: Assigning smoothed river elevations to floodplain pixels...")
+
+    p_safe       = np.where(parent >= 0, parent, 0).astype(np.int64)
+    root_is_rv   = is_river[p_safe]
+    nearest_rv   = np.where(root_is_rv, parent, -1).astype(np.int64)
+    del parent
+    gc.collect()
+
+    # Map every river pixel → smoothed elevation (nearest centerline point)
+    rv_idx  = np.where(is_river)[0]
+    rp_rows = rv_idx // cols
+    rp_cols = rv_idx % cols
+
+    a_t, b_t, c_t = dem_transform.a, dem_transform.b, dem_transform.c
+    d_t, e_t, f_t = dem_transform.d, dem_transform.e, dem_transform.f
+    rp_x = c_t + a_t * rp_cols.astype(float) + b_t * rp_rows.astype(float)
+    rp_y = f_t + d_t * rp_cols.astype(float) + e_t * rp_rows.astype(float)
+
+    river_xy   = np.array([(p.x, p.y) for p in pts_gdf.geometry], dtype=np.float64)
+    river_elev = pts_gdf["elevation"].values.astype(np.float32)
+
+    kd = KDTree(river_xy)
+    _, rp_match = kd.query(np.column_stack([rp_x, rp_y]), k=1)
+    rv_pixel_elev = river_elev[rp_match]
+
+    elev_lut = np.full(n, np.nan, dtype=np.float32)
+    elev_lut[rv_idx] = rv_pixel_elev
+
+    # Euclidean distance + nearest-river-pixel index for every pixel.
+    # Used for (a) max_dist cutoff and (b) fallback for pixels the D8 routing
+    # didn't connect to the river (DEM edges, flow exiting extent, flat areas).
+    log_step("HAND: Computing Euclidean distance transform for coverage fallback...")
+    edt_dist, (edt_row, edt_col) = distance_transform_edt(~is_river_2d, return_indices=True)
+    edt_dist  *= pixel_size                                    # convert px → metres
+    edt_rv_idx = (edt_row * cols + edt_col).ravel().astype(np.int64)   # flat index of nearest river px
+
+    # ── Primary HAND assignment ────────────────────────────────────────────
+    has_rv      = nearest_rv >= 0
+    within_dist = edt_dist.ravel() <= max_dist
+    nr_safe     = np.where(has_rv, nearest_rv, 0).astype(np.int64)
+    base_flat   = np.where(has_rv & within_dist,
+                           elev_lut[nr_safe], np.nan).astype(np.float32)
+
+    # ── Euclidean fallback for unconnected pixels ─────────────────────────
+    # Pixels where D8 routing didn't reach the river (DEM-edge effects, sinks
+    # outside the river catchment, pysheds flat-resolution artefacts) are
+    # assigned the elevation of their Euclidean-nearest river pixel.
+    # This matches the coverage behaviour of the other engines while preserving
+    # correct HAND assignments everywhere the flow routing succeeded.
+    unconnected = (~has_rv) & within_dist
+    n_fallback  = int(np.sum(unconnected))
+    if n_fallback > 0:
+        log_step(f"HAND: {n_fallback:,} pixels unconnected by flow routing — "
+                 f"applying Euclidean nearest-river fallback for full coverage.")
+        fallback_elev = elev_lut[edt_rv_idx[unconnected]]
+        base_flat[unconnected] = np.where(
+            np.isfinite(fallback_elev), fallback_elev, np.nan
+        )
+
+    hand_count     = int(np.sum(has_rv & within_dist))
+    fallback_count = n_fallback
+    del nearest_rv, elev_lut, edt_dist, edt_row, edt_col, edt_rv_idx
+    del is_river, is_river_2d
+    gc.collect()
+
+    # ── Write memmap ───────────────────────────────────────────────────────
+    base_filename = os.path.join(temp_dir, "rem_base_surface.dat")
+    out = np.memmap(base_filename, dtype='float32', mode='w+', shape=(rows, cols))
+    out[:, :] = base_flat.reshape(rows, cols)
+    out.flush()
+
+    log_step(
+        f"HAND: Done. River pixels: {len(rv_idx):,}. "
+        f"Flow-routed: {hand_count:,} px. "
+        f"Euclidean fallback: {fallback_count:,} px."
+    )
     return out, base_filename
 
 
@@ -464,10 +956,15 @@ def stream_rem_subtraction(dem_path, base_memmap, output_path, max_value=None):
 
 def main_rem_calc(dem_folder, river_shp, output_rem_path, spacing=20, tile_size=2048, k_neighbors=100, max_value=None,
                   threads=None, idw_power=None, roads_path=None, bridge_buffer_m=25.0,
-                  enforce_isotonic=True, max_search_dist=None, engine="scipy", data_source="user_upload", **kwargs):
-    
+                  enforce_isotonic=True, max_search_dist=None, engine="projection", data_source="user_upload", **kwargs):
+
     log_step(f"--- STARTED REM CALCULATION ---")
-    log_step(f"Engine: SCIPY (Optimized + Smart Z-Filter)")
+    _ENGINE_LABELS = {
+        "hand":       "HAND (Height Above Nearest Drainage)",
+        "projection": "Flow-Weighted (smooth, bend-safe)",
+        "idw":        "IDW / SciPy KDTree",
+    }
+    log_step(f"Engine: {_ENGINE_LABELS.get(engine, engine)}")
     if threads is None: threads = -1
     
     # Safety Default for Power to prevent TypeError
@@ -495,7 +992,9 @@ def main_rem_calc(dem_folder, river_shp, output_rem_path, spacing=20, tile_size=
     if roads_path: pts_gdf = _remove_points_near_bridges(pts_gdf, roads_path, buffer_m=bridge_buffer_m, crs=rivers.crs)
 
     log_step(f"Using {len(pts_gdf)} river points.")
-    tangents, normals = _compute_tangents_normals(pts_gdf)
+
+    # Compute initial tangents/normals for cross-section geometry (before elevation filtering)
+    tangents_init, normals = _compute_tangents_normals(pts_gdf)
 
     # Calculate adaptive widths to prevent cross-section overlaps and bowtie intersections
     log_step("Calculating smart adaptive cross-section widths (prevents overlaps in high sinuosity reaches)...")
@@ -515,6 +1014,13 @@ def main_rem_calc(dem_folder, river_shp, output_rem_path, spacing=20, tile_size=
         log_step(f"Auto-calculated smoothing window: {adaptive_window}m (based on river length)")
 
         pts_gdf = _sanitize_profile(pts_gdf, spacing, adaptive_window, 2, 1e-4, enforce_isotonic)
+
+    # Recompute tangents on the FINAL filtered point set.
+    # Bridge spike removal and NaN filtering can remove points, which would
+    # misalign pre-computed tangents with the river_coords array passed to the
+    # interpolation engine.  Recomputing here guarantees exact correspondence.
+    final_tangents, _ = _compute_tangents_normals(pts_gdf)
+    log_step(f"Final river profile: {len(pts_gdf)} points after all filtering.")
 
     # Calculate absolute z cutoff
     absolute_cutoff = None
@@ -540,11 +1046,22 @@ def main_rem_calc(dem_folder, river_shp, output_rem_path, spacing=20, tile_size=
     
     try:
         temp_dir = tempfile.mkdtemp()
-        
-        base_memmap, base_file = generate_base_surface_memmap(
-            dem_path, dem_meta['transform'], dem_meta['shape'], pts_gdf, tile_size=tile_size, k_neighbors=k_neighbors,
-            power=idw_power, workers=threads, temp_dir=temp_dir, max_dist=max_search_dist, absolute_cutoff=absolute_cutoff
-        )
+
+        if engine == "hand":
+            base_memmap, base_file = generate_base_surface_hand(
+                dem_path, dem_meta['transform'], dem_meta['shape'], pts_gdf,
+                temp_dir=temp_dir, spacing=spacing,
+                max_dist=max_search_dist, absolute_cutoff=absolute_cutoff,
+            )
+        else:
+            base_memmap, base_file = generate_base_surface_memmap(
+                dem_path, dem_meta['transform'], dem_meta['shape'], pts_gdf,
+                tile_size=tile_size, k_neighbors=k_neighbors,
+                power=idw_power, workers=threads, temp_dir=temp_dir,
+                max_dist=max_search_dist, absolute_cutoff=absolute_cutoff,
+                engine=engine, river_s=pts_gdf["s"].values, spacing=spacing,
+                tangents=final_tangents if engine == "projection" else None,
+            )
         
         stream_rem_subtraction(dem_path, base_memmap, output_rem_path, max_value=max_value)
         
