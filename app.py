@@ -221,7 +221,8 @@ download_and_mosaic_dems      = dc.download_and_mosaic_dems
 choose_and_save_nhd_river     = dc.choose_and_save_nhd_river
 scan_nhd_rivers               = dc.scan_nhd_rivers
 get_available_project_resolutions = dc.get_available_project_resolutions
-get_available_dem_resolutions = dc.get_available_dem_resolutions
+get_available_dem_resolutions     = dc.get_available_dem_resolutions
+get_available_wcs_resolutions     = dc.get_available_wcs_resolutions
 reproject_vector_to_match_dem = utils.reproject_vector_to_match_dem
 create_hillshade              = hillshade_module.create_hillshade
 style_rem                     = style_rem_module
@@ -556,7 +557,7 @@ def fetch_dem_coverage_footprints(bounds: tuple, radius_km: float = 100, aoi_geo
     # Query USGS TNM API
     try:
         api_url = "https://tnmaccess.nationalmap.gov/api/v1/products"
-        params = {"bbox": bbox_str, "prodFormats": "GeoTIFF", "max": 1000}
+        params = {"bbox": bbox_str, "prodFormats": "GeoTIFF", "max": 10000}
 
         r = requests.get(api_url, params=params, timeout=30)
         if r.status_code == 200:
@@ -571,7 +572,8 @@ def fetch_dem_coverage_footprints(bounds: tuple, radius_km: float = 100, aoi_geo
                     continue
 
                 # Skip S1M tiles
-                is_s1m = "s1m" in title or "standard 1-meter" in title
+                durl = item.get("downloadURL", "")
+                is_s1m = "s1m" in title or "standard 1-meter" in title or "/S1M/" in durl
                 if is_s1m:
                     continue
 
@@ -908,31 +910,21 @@ with col_left:
                 # Check available DEM resolutions
                 with st.spinner("Checking available DEM resolutions..."):
                     avail_res = get_available_project_resolutions(tpath)
-                    st.session_state["available_resolutions"] = avail_res
                     if not avail_res:
-                        st.warning("No Project tiles found. WCS tiles (lower quality) available as fallback.")
-                    else:
-                        st.success(f" Available: {avail_res}")
+                        # Catalog down or no project tiles — fall back to 3DEP Elevation Index
+                        avail_res = get_available_wcs_resolutions(tpath)
+                    st.session_state["available_resolutions"] = avail_res
             else:
                 st.error("Draw AOI first.")
 
 
-        # Resolution dropdown (only show if resolutions are available)
+        # Resolution dropdown
         if st.session_state["available_resolutions"]:
             dem_res_input = st.selectbox(
-                "DEM Resolution (Project tiles - high quality)",
+                "DEM Resolution",
                 options=st.session_state["available_resolutions"],
                 format_func=lambda x: f"{x}m",
                 disabled=st.session_state["run_requested"],
-                help="Only showing resolutions where Project tiles cover >30% of AOI"
-            )
-        elif st.session_state["scanned_river_list"]:  # AOI scanned but no Project tiles
-            st.warning("No Project tiles available. Using WCS fallback.")
-            dem_res_input = st.selectbox(
-                "DEM Resolution (WCS - lower quality)",
-                options=[10, 30],
-                format_func=lambda x: f"{x}m (WCS fallback)",
-                disabled=st.session_state["run_requested"]
             )
         else:
             st.info("Scan AOI to see available resolutions")
@@ -1119,7 +1111,12 @@ with col_left:
         st.markdown("""
         **Spacing (m):** Controls the distance between sampling points along the river. Lower values increase accuracy but significantly increase computation time and memory usage.
 
-        **K Neighbors (IDW):** Defines how many nearby river points influence each terrain cell during interpolation. Higher values create smoother REMs but may lose fine detail. Range: 4 (sharp/detailed) to 300 (very smooth). Default 8 works well for most cases.
+        **Interpolation Engine:**
+        - **HAND (recommended):** Height Above Nearest Drainage. Follows the actual D8 flow network downhill from each terrain pixel to the river. Completely eliminates perpendicular-line artifacts — assignment follows real water-flow paths, not geometric distance. Requires `pysheds` and loads the full DEM into RAM for flow routing.
+        - **Flow-Weighted:** Weights each nearby river cross-section by how far upstream/downstream the pixel is from it (along-channel distance). Smooth blending, no hard zone boundaries. Good for very large DEMs where HAND RAM usage is a concern.
+        - **IDW (legacy):** Inverse Distance Weighting. Blends elevations from the nearest K river points using distance-based weights. Isotropic — does not account for channel direction. Included for comparison with older outputs.
+
+        **K Neighbors (IDW only):** Only active when IDW engine is selected. Defines how many nearby river points influence each terrain cell. Higher values create smoother REMs. Range: 4 (sharp) to 300 (very smooth).
 
         **CPU Usage:** Controls how many processor cores are used for calculations. Higher values speed up processing but may slow down other applications.
         - **Low (25-50%):** Use while working on other tasks. Keeps computer responsive.
@@ -1133,7 +1130,31 @@ with col_left:
 
     spacing = st.number_input("Spacing (m)", min_value=1, max_value=500, value=20, step=1, disabled=st.session_state["run_requested"])
 
-    k_neighbors = st.number_input("K Neighbors (IDW)", min_value=4, max_value=300, value=8, step=1, disabled=st.session_state["run_requested"])
+    engine_choice = st.radio(
+        "Interpolation Engine",
+        options=["HAND (Hydrologic)", "Flow-Weighted", "IDW (legacy)"],
+        index=0,
+        disabled=st.session_state["run_requested"],
+        help="HAND is recommended — it follows real flow paths and eliminates all geometric artifacts. Flow-Weighted is a fast fallback for very large DEMs."
+    )
+    _ENGINE_MAP = {
+        "HAND (Hydrologic)": "hand",
+        "Flow-Weighted":     "projection",
+        "IDW (legacy)":      "idw",
+    }
+    selected_engine = _ENGINE_MAP[engine_choice]
+
+    if selected_engine == "hand":
+        st.info(
+            "**HAND** loads the full DEM into RAM for flow routing (requires `pysheds`). "
+            "For very large DEMs (>1 GB) consider **Flow-Weighted** instead.",
+            icon="ℹ️",
+        )
+
+    if selected_engine == "idw":
+        k_neighbors = st.number_input("K Neighbors (IDW)", min_value=4, max_value=300, value=8, step=1, disabled=st.session_state["run_requested"])
+    else:
+        k_neighbors = 8  # unused by HAND / Flow-Weighted engines
 
     # This automatically scales. 8 cores -> 4 threads. 16 cores -> 8 threads
     cpu_util_percent = st.slider("CPU Usage", 10, 100, 75, 5, disabled=st.session_state["run_requested"], format="%d%%", help="Recommended: 75%. Lower if computer feels sluggish.")
@@ -1580,7 +1601,7 @@ if st.session_state.get("run_requested"):
                 hillshade_module.create_hillshade_fast_qa(
                     dem_file,
                     hs_path,
-                    downsample_factor=4,
+                    downsample_factor=1,
                     z_factor=5.5
                 )
             st.session_state["hillshade_qa_generated"] = True
@@ -1673,8 +1694,6 @@ if st.session_state.get("run_requested"):
 
         max_m_vis = viz_m_val if viz_m_val is not None else None
         
-        # Force Projection Mode
-        base_mode_auto = "projection"
         k_auto = int(k_neighbors)
 
         # Detect data source for adaptive cross-section width
@@ -1693,8 +1712,7 @@ if st.session_state.get("run_requested"):
             max_value=max_m_comp,
             threads=threads,
             idw_power=None,
-            base_mode=base_mode_auto,
-            engine="scipy",
+            engine=selected_engine,
             data_source=data_source
         )
 
@@ -1898,7 +1916,9 @@ if st.session_state.get("run_requested"):
         }
 
         # CALL THE FUNCTION
-        utils.generate_full_stats_report(rem_tif, dem_file, report_config, stats_txt_path)
+        _riv_shp_for_report = st.session_state.get("reprojected_river_path")
+        utils.generate_full_stats_report(rem_tif, dem_file, report_config, stats_txt_path,
+                                         river_shp=_riv_shp_for_report)
                 
         # Add to the UI display
         st.success(f" Statistics Report generated: {os.path.basename(stats_txt_path)}")
@@ -1948,9 +1968,10 @@ if st.session_state.get("rem_done") and not st.session_state.get("run_requested"
                         "dem_file", "dem_stats", "memory_safe", "dem_folder_for_run", "river_vector_path",
                         "aoi_geojson_path", "hillshade_output", "aerial_output", "reprojected_river_path",
                         "dem_folder", "rem_folder", "visuals_folder", "extra_data_folder",
-                        "scanned_river_list", "pipeline_start_time", "qa_png", "memory_override"]:
+                        "scanned_river_list", "pipeline_start_time", "qa_png", "memory_override",
+                        "available_resolutions"]:
                 if key in st.session_state:
-                    st.session_state[key] = [] if key == "scanned_river_list" else (0.0 if key == "pipeline_start_time" else None)
+                    st.session_state[key] = [] if key in ("scanned_river_list", "available_resolutions") else (0.0 if key == "pipeline_start_time" else None)
             st.session_state["run_requested"] = False
             st.session_state["prep_done"] = False
             st.session_state["dem_acquired"] = False  # Reset DEM for new run
