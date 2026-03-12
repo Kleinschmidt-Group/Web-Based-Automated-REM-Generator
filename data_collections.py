@@ -58,6 +58,15 @@ try:
 except ImportError:
     print("WARNING: 'py3dep', 'xarray', 'rioxarray', or 'dask' not found. Smart Mosaic will fail.")
 
+try:
+    import pystac_client
+    import planetary_computer
+    import odc.stac as odc_stac
+    _STAC_AVAILABLE = True
+except ImportError:
+    _STAC_AVAILABLE = False
+    logger_init_warn = "pystac-client, planetary-computer, or odc-stac not installed. STAC download unavailable."
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -334,7 +343,7 @@ def get_available_project_resolutions(aoi_geojson_path: str, min_coverage_percen
         
         # USGS TNM API (Works everywhere)
         api_url = "https://tnmaccess.nationalmap.gov/api/v1/products"
-        params = {"bbox": bbox_str, "prodFormats": "GeoTIFF", "max": 3000}
+        params = {"bbox": bbox_str, "prodFormats": "GeoTIFF", "max": 10000}
         
         resolution_keywords = {
             1: ["1 meter", "1m", "one meter"],  # Lidar projects - keep as-is
@@ -402,12 +411,36 @@ def get_available_project_resolutions(aoi_geojson_path: str, min_coverage_percen
         return sorted(available_resolutions)
 
     except Exception as e:
-        logger.error(f"Failed to check availability: {e}")
-        return []
+        logger.error(f"Failed to check availability (catalog API down or unreachable): {e}")
+        return None  # None = API failure; [] = API worked but no tiles found
 
 def get_available_dem_resolutions(aoi_geojson_path: str) -> List[int]:
     return get_available_project_resolutions(aoi_geojson_path)
 
+
+def get_available_wcs_resolutions(aoi_geojson_path: str) -> List[int]:
+    """Check DEM availability via 3DEP Elevation Index (independent of ScienceBase/TNM catalog).
+    Uses py3dep.check_3dep_availability which queries a separate index service.
+    Falls back to standard CONUS resolutions [10, 30] if the check itself fails.
+    """
+    try:
+        import py3dep as _py3dep
+        aoi_gdf = gpd.read_file(aoi_geojson_path)
+        if aoi_gdf.crs is None: aoi_gdf = aoi_gdf.set_crs("EPSG:4326")
+        elif aoi_gdf.crs.to_epsg() != 4326: aoi_gdf = aoi_gdf.to_crs("EPSG:4326")
+
+        bbox = tuple(float(x) for x in aoi_gdf.total_bounds)  # (minx, miny, maxx, maxy)
+        logger.info(f"Checking 3DEP WCS availability for bbox: {bbox}")
+        avail = _py3dep.check_3dep_availability(bbox, crs=4326)
+        logger.info(f"3DEP WCS availability: {avail}")
+
+        res_map = {"1m": 1, "3m": 3, "5m": 5, "10m": 10, "30m": 30, "60m": 60}
+        result = sorted([res_map[k] for k, v in avail.items() if v is True and k in res_map])
+        logger.info(f"WCS available resolutions: {result}")
+        return result if result else [10, 30]
+    except Exception as e:
+        logger.error(f"WCS availability check failed: {e}")
+        return [10, 30]
 
 
 # STRATEGY A: Source/Project API (With Validation)
@@ -668,6 +701,249 @@ def _download_via_source_api(aoi_gdf, output_folder, resolution, n_jobs=DEFAULT_
     valid_files = [r for r in res if r]
     return valid_files
 
+
+# STRATEGY A2: Direct S3 Tile Download (bypasses ScienceBase catalog)
+#
+# 10m / 30m: tiles are in a national 1°×1° cell grid — cell name is computable
+#   directly from lat/lon.  Path: StagedProducts/Elevation/{13|1}/TIFF/historical/n{lat}w{lon}/
+#
+# 1m: tiles are organized by survey project, NOT by a uniform cell grid.
+#   - 3DEP Elevation Index (index.nationalmap.gov, independent of ScienceBase) gives
+#     the project name(s) that cover the AOI.
+#   - Each project stores 10km×10km tiles named USGS_1M_{zone}_x{x}y{y}_{project}.tif
+#     where zone = UTM zone, x = easting/10000, y = northing/10000.
+#   - We decode that grid to find which tiles intersect the AOI, then download only those.
+
+_S3_BASE = "https://prd-tnm.s3.amazonaws.com"
+_S3_ARC_DIR = {10: "13", 30: "1"}  # 1/3 arc-sec = 10m, 1 arc-sec = 30m
+_3DEP_INDEX_BASE = "https://index.nationalmap.gov/arcgis/rest/services/3DEPElevationIndex/MapServer"
+_1M_PROJECT_LAYER = 18   # Layer 18: 1 Meter project footprints with S3 product_link
+
+
+def _s3_cells_for_aoi(aoi_gdf: gpd.GeoDataFrame):
+    """Return the set of 1°×1° cell names (e.g. 'n44w112') intersecting the AOI."""
+    if aoi_gdf.crs is None:
+        aoi_gdf = aoi_gdf.set_crs("EPSG:4326")
+    elif aoi_gdf.crs.to_epsg() != 4326:
+        aoi_gdf = aoi_gdf.to_crs("EPSG:4326")
+    minx, miny, maxx, maxy = aoi_gdf.total_bounds
+    cells = set()
+    # Cell n{lat}w{lon} covers (lat-1)°N–lat°N, (lon-1)°W–lon°W
+    for lat in range(int(np.floor(miny)) + 1, int(np.ceil(maxy)) + 1):
+        for lon in range(int(np.floor(abs(minx))) + 1, int(np.ceil(abs(maxx))) + 1):
+            cells.add(f"n{lat:02d}w{lon:03d}")
+    return cells
+
+
+def _s3_latest_tile_url(arc_dir: str, cell: str) -> Optional[str]:
+    """List the S3 directory for a cell and return the URL of the most recent .tif."""
+    import xml.etree.ElementTree as ET
+    prefix = f"StagedProducts/Elevation/{arc_dir}/TIFF/historical/{cell}/"
+    list_url = f"{_S3_BASE}/?prefix={prefix}&list-type=2"
+    try:
+        r = requests.get(list_url, timeout=30)
+        if r.status_code != 200:
+            return None
+        root = ET.fromstring(r.content)
+        ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+        tif_files = []
+        for content in root.findall("s3:Contents", ns):
+            key = content.find("s3:Key", ns).text
+            last_mod = content.find("s3:LastModified", ns).text
+            if key and key.endswith(".tif"):
+                tif_files.append((last_mod, key))
+        if not tif_files:
+            return None
+        tif_files.sort(reverse=True)  # newest first
+        return f"{_S3_BASE}/{tif_files[0][1]}"
+    except Exception as e:
+        logger.warning(f"S3 listing failed for {cell}: {e}")
+        return None
+
+
+def _s3_1m_project_prefixes(aoi_gdf: gpd.GeoDataFrame) -> List[str]:
+    """
+    Query the 3DEP Elevation Index (independent of ScienceBase) for all 1m projects
+    whose footprint intersects the AOI.  Returns S3 key prefixes like
+    'StagedProducts/Elevation/1m/Projects/{name}/TIFF/'.
+    """
+    if aoi_gdf.crs is None:
+        aoi_gdf = aoi_gdf.set_crs("EPSG:4326")
+    elif aoi_gdf.crs.to_epsg() != 4326:
+        aoi_gdf = aoi_gdf.to_crs("EPSG:4326")
+    minx, miny, maxx, maxy = aoi_gdf.total_bounds
+    url = f"{_3DEP_INDEX_BASE}/{_1M_PROJECT_LAYER}/query"
+    params = {
+        "geometry": f"{minx},{miny},{maxx},{maxy}",
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": "4326",
+        "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "project,product_link",
+        "returnGeometry": "false",
+        "f": "json",
+    }
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        data = r.json()
+        prefixes = []
+        for feat in data.get("features", []):
+            attrs = feat.get("attributes", {})
+            project = attrs.get("project", "")
+            if project:
+                prefix = f"StagedProducts/Elevation/1m/Projects/{project}/TIFF/"
+                prefixes.append(prefix)
+                logger.info(f"  1m project: {project}")
+        return prefixes
+    except Exception as e:
+        logger.warning(f"3DEP Index query for 1m projects failed: {e}")
+        return []
+
+
+def _s3_1m_intersecting_urls(prefix: str, aoi_gdf: gpd.GeoDataFrame) -> List[str]:
+    """
+    List all tiles under an S3 project TIFF prefix, decode each tile's geographic
+    bbox from its filename (USGS_1M_{zone}_x{x}y{y}_...) and return URLs for tiles
+    that intersect the AOI.
+
+    Tile grid: each tile covers a 10km×10km block in UTM.
+      CRS  = EPSG:269{zone}  (e.g. zone=12 → EPSG:26912)
+      xmin = x * 10000,  xmax = (x+1) * 10000   (easting, metres)
+      ymin = y * 10000,  ymax = (y+1) * 10000   (northing, metres)
+    """
+    import xml.etree.ElementTree as ET
+    import re
+    from pyproj import Transformer
+    from shapely.geometry import box as shapely_box
+
+    # Ensure AOI in WGS84 for intersection test
+    if aoi_gdf.crs is None:
+        aoi_gdf = aoi_gdf.set_crs("EPSG:4326")
+    elif aoi_gdf.crs.to_epsg() != 4326:
+        aoi_gdf = aoi_gdf.to_crs("EPSG:4326")
+    aoi_union = aoi_gdf.geometry.unary_union
+
+    # List all .tif files in the S3 prefix
+    list_url = f"{_S3_BASE}/?prefix={prefix}&list-type=2"
+    try:
+        r = requests.get(list_url, timeout=60)
+        if r.status_code != 200:
+            return []
+        root = ET.fromstring(r.content)
+        ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+        all_keys = [
+            c.find("s3:Key", ns).text
+            for c in root.findall("s3:Contents", ns)
+            if c.find("s3:Key", ns).text.endswith(".tif")
+        ]
+    except Exception as e:
+        logger.warning(f"S3 listing failed for 1m prefix {prefix}: {e}")
+        return []
+
+    logger.info(f"  Listed {len(all_keys)} tiles — filtering to AOI...")
+
+    # Cache transformers by UTM zone to avoid re-creating them
+    _transformers: dict = {}
+    matching = []
+
+    pattern = re.compile(r"USGS_1M_(\d+)_x(\d+)y(\d+)_", re.IGNORECASE)
+
+    for key in all_keys:
+        fname = os.path.basename(key)
+        m = pattern.search(fname)
+        if not m:
+            continue
+        zone = int(m.group(1))
+        x    = int(m.group(2))
+        y    = int(m.group(3))
+
+        epsg = 26900 + zone  # EPSG:26911 for zone 11, 26912 for zone 12, etc.
+        if epsg not in _transformers:
+            _transformers[epsg] = Transformer.from_crs(
+                f"EPSG:{epsg}", "EPSG:4326", always_xy=True
+            )
+        tf = _transformers[epsg]
+
+        # Tile corners in UTM.
+        # x labels the LEFT  (min easting):  tile covers [x*10000, (x+1)*10000]
+        # y labels the TOP   (max northing):  tile covers [(y-1)*10000, y*10000]
+        x0, x1 = x * 10000, (x + 1) * 10000
+        y0, y1 = (y - 1) * 10000, y * 10000
+
+        # Convert all four corners to WGS84 and build a bounding box
+        lons, lats = [], []
+        for ex in (x0, x1):
+            for ey in (y0, y1):
+                lon, lat = tf.transform(ex, ey)
+                lons.append(lon)
+                lats.append(lat)
+        tile_box = shapely_box(min(lons), min(lats), max(lons), max(lats))
+
+        if tile_box.intersects(aoi_union):
+            matching.append(f"{_S3_BASE}/{key}")
+
+    logger.info(f"  {len(matching)} tile(s) intersect AOI")
+    return matching
+
+
+def _download_via_s3_direct(aoi_gdf: gpd.GeoDataFrame, output_folder: str,
+                             resolution: int, n_jobs: int = DEFAULT_JOBS) -> Optional[list]:
+    """
+    Strategy A2: Download raw USGS project tiles directly from S3.
+    Bypasses the ScienceBase/TNM catalog — same tile quality as Strategy A.
+
+    10m / 30m  →  1°×1° national cell grid (cell name computed from lat/lon)
+    1m         →  project-based tiles via 3DEP Elevation Index + filename grid decode
+    """
+    temp_dir = os.path.join(output_folder, "temp_s3_tiles")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------ 10m / 30m
+    if resolution in _S3_ARC_DIR:
+        arc_dir = _S3_ARC_DIR[resolution]
+        cells = _s3_cells_for_aoi(aoi_gdf)
+        if not cells:
+            return None
+        logger.info(f"Strategy A2 (S3 Direct): Listing {len(cells)} cell(s) for {resolution}m raw tiles...")
+        tile_urls = []
+        for cell in sorted(cells):
+            url = _s3_latest_tile_url(arc_dir, cell)
+            if url:
+                logger.info(f"  {cell} → {os.path.basename(url)}")
+                tile_urls.append(url)
+            else:
+                logger.warning(f"  {cell} → no tile found in S3")
+
+    # ------------------------------------------------------------------ 1m
+    elif resolution == 1:
+        logger.info("Strategy A2 (S3 Direct): Querying 3DEP Index for 1m project tiles...")
+        prefixes = _s3_1m_project_prefixes(aoi_gdf)
+        if not prefixes:
+            logger.warning("Strategy A2: No 1m projects found via 3DEP Index.")
+            return None
+        tile_urls = []
+        for prefix in prefixes:
+            urls = _s3_1m_intersecting_urls(prefix, aoi_gdf)
+            tile_urls.extend(urls)
+        if not tile_urls:
+            logger.warning("Strategy A2: No 1m tiles intersect AOI after grid decode.")
+            return None
+
+    else:
+        return None  # unsupported resolution
+
+    if not tile_urls:
+        logger.warning(f"Strategy A2: No tiles found for {resolution}m.")
+        return None
+
+    tasks = [
+        (url, os.path.join(temp_dir, f"s3tile_{i}.tif"), i + 1, len(tile_urls))
+        for i, url in enumerate(tile_urls)
+    ]
+    results = Parallel(n_jobs=min(n_jobs, len(tile_urls)), backend="threading")(
+        delayed(_download_file_worker)(u, d, idx, total) for u, d, idx, total in tasks
+    )
+    valid = [r for r in results if r]
+    return valid if valid else None
 
 
 # STRATEGY B: WCS Tiling (With Validation)
@@ -1068,7 +1344,7 @@ def _mosaic_rasterio_safe(src_paths: List[str], out_path: str, resolution: int, 
             reproj_tasks.append((src_path, dst_path, dst_crs, resolution, i+1, len(src_paths)))
 
         # Execute reprojection in parallel (conservative parallelism for memory safety)
-        n_jobs = min(CONSERVATIVE_JOBS, multiprocessing.cpu_count())
+        n_jobs = min(DEFAULT_JOBS, multiprocessing.cpu_count())
         reprojected_paths = Parallel(n_jobs=n_jobs, backend="threading")(
             delayed(_reproject_tile_worker)(src, dst, crs, res, idx, total)
             for src, dst, crs, res, idx, total in reproj_tasks
@@ -1154,6 +1430,122 @@ def _mosaic_rasterio_safe(src_paths: List[str], out_path: str, resolution: int, 
 
 
 
+# STRATEGY C: Planetary Computer STAC (COG windowed read — no full tile download)
+# Supports 10m and 30m for all US via 3dep-seamless, plus 30m global via Copernicus.
+# Completely independent of ScienceBase. Reprojects to EPSG:5070 on the fly.
+
+def _download_via_stac(aoi_gdf: gpd.GeoDataFrame, output_folder: str,
+                       resolution: int, elevation_clamp: Optional[float] = None) -> Optional[str]:
+    if not _STAC_AVAILABLE:
+        logger.warning("STAC libraries not installed. Skipping Strategy C.")
+        return None
+    if resolution not in [10, 30]:
+        return None  # STAC seamless collection only has 10m and 30m
+
+    try:
+        if aoi_gdf.crs is None: aoi_gdf = aoi_gdf.set_crs("EPSG:4326")
+        elif aoi_gdf.crs.to_epsg() != 4326: aoi_gdf = aoi_gdf.to_crs("EPSG:4326")
+        bbox = tuple(float(x) for x in aoi_gdf.total_bounds)  # (minx, miny, maxx, maxy) — exact, used for pixel load
+
+        # Buffer the search bbox so tiles at AOI edges (near 1°x1° tile boundaries) are captured.
+        # Pixel loading still uses the exact bbox — only the STAC catalog search is buffered.
+        SEARCH_BUFFER = 0.05  # ~5 km; enough to capture adjacent tiles at any edge
+        search_bbox = (
+            bbox[0] - SEARCH_BUFFER,
+            bbox[1] - SEARCH_BUFFER,
+            bbox[2] + SEARCH_BUFFER,
+            bbox[3] + SEARCH_BUFFER,
+        )
+
+        cat = pystac_client.Client.open(
+            "https://planetarycomputer.microsoft.com/api/stac/v1",
+            modifier=planetary_computer.sign_inplace
+        )
+
+        # Try 3DEP Seamless first (US-wide: CONUS + Alaska + Hawaii)
+        logger.info(f"Strategy C (STAC): Searching 3dep-seamless for {resolution}m items (buffered bbox)...")
+        search = cat.search(collections=["3dep-seamless"], bbox=search_bbox, max_items=50)
+        items = [planetary_computer.sign(i) for i in search.items()
+                 if i.properties.get("gsd") == resolution]
+
+        collection_used = "3dep-seamless"
+
+        # Fallback: Copernicus 30m for areas outside 3DEP coverage
+        if not items and resolution == 30:
+            logger.info("3dep-seamless returned no items. Trying Copernicus GLO-30...")
+            search = cat.search(collections=["cop-dem-glo-30"], bbox=search_bbox, max_items=50)
+            cop_items = list(search.items())
+            items = [planetary_computer.sign(i) for i in cop_items]
+            collection_used = "cop-dem-glo-30"
+
+        if not items:
+            logger.warning(f"Strategy C: No STAC items found for {resolution}m in bbox {bbox}")
+            return None
+
+        logger.info(f"Strategy C: Loading {resolution}m from {len(items)} COG(s) [{collection_used}]...")
+
+        # Determine band name by collection
+        band = "data" if collection_used == "3dep-seamless" else "data"
+        if collection_used == "cop-dem-glo-30":
+            # Copernicus uses 'data' asset too, but check first item
+            band = list(items[0].assets.keys())[0] if items else "data"
+
+        # Both 10m and 30m use rioxarray direct windowed read + explicit reproject.
+        # odc.stac.load was dropped because its geographic→projected resolution conversion
+        # can silently select a coarser COG overview level (e.g., 20m overview for a 10m
+        # request), producing upsampled/blurry output. overview_level=0 forces native-res read.
+        import rioxarray as _rxr
+        tile_arrays = []
+        for item in items:
+            href = item.assets[band].href
+            logger.info(f"  Reading COG: {os.path.basename(href)}")
+            da = _rxr.open_rasterio(href, masked=True, lock=False, overview_level=0)
+            # Clip to AOI bbox before reproject to minimise data held in memory
+            da_clip = da.squeeze(drop=True).rio.clip_box(
+                minx=bbox[0], miny=bbox[1], maxx=bbox[2], maxy=bbox[3],
+                crs="EPSG:4326"
+            )
+            da_reproj = da_clip.rio.reproject(
+                "EPSG:5070",
+                resolution=resolution,
+                resampling=rasterio.enums.Resampling.bilinear,
+                nodata=-9999.0,
+            )
+            tile_arrays.append(da_reproj)
+
+        if len(tile_arrays) == 1:
+            elev = tile_arrays[0]
+        else:
+            from rioxarray.merge import merge_arrays as _merge
+            elev = _merge(tile_arrays, nodata=-9999.0)
+
+        elev = elev.astype("float32")
+        # Replace any remaining masked/inf values with nodata
+        elev = elev.where(np.isfinite(elev.values), other=-9999.0)
+
+        # Apply elevation clamp if provided (matching existing pipeline behaviour)
+        if elevation_clamp is not None:
+            elev = elev.where(elev <= elevation_clamp, other=-9999.0)
+
+        # Ensure nodata is written into the file metadata
+        elev = elev.rio.write_nodata(-9999.0, inplace=True)
+        elev = elev.rio.write_crs("EPSG:5070", inplace=True)
+
+        out_path = os.path.join(output_folder, f"mosaic_{resolution}m_dem.tif")
+        elev.rio.to_raster(out_path, compress="lzw", dtype="float32")
+
+        valid_count = int((elev.values != -9999.0).sum())
+        total_count = elev.values.size
+        logger.info(f"Strategy C complete: {out_path}  "
+                    f"shape={elev.shape}  valid={valid_count}/{total_count} pixels  "
+                    f"source={collection_used}")
+        return out_path
+
+    except Exception as e:
+        logger.error(f"Strategy C (STAC) failed: {e}")
+        return None
+
+
 # Orchestrator (Hybrid Strategy)
 
 
@@ -1198,24 +1590,68 @@ def download_and_mosaic_dems(
                 logger.info("Small AOI - using IFSAR priority for highest detail")
                 alaska_5m_strategy = "ifsar"
 
-    valid_tiles = []
-
-    # Always prioritize Project Tiles (more reliable, higher quality)
-    logger.info(f"Attempting {resolution}m download via Project Tiles (Strategy A)...")
-    valid_tiles = _download_via_source_api(aoi_gdf, output_folder, resolution, n_jobs_download, alaska_5m_strategy)
-
-    if not valid_tiles:
-        logger.warning(f" Project tiles not available or failed. Fallback to WCS (Strategy B)...")
-        valid_tiles = _download_via_wcs(aoi_gdf, output_folder, resolution)
-
-    if not valid_tiles:
-        logger.error(f"Download failed for {resolution}m resolution.")
-        return None
-
-    mosaic_path = os.path.join(output_folder, f"mosaic_{resolution}m_dem.tif")
     clamp = elevation_clamp if elevation_clamp is not None else cfg.ELEVATION_CLAMP_THRESHOLD
+    result = None
 
-    result = _mosaic_with_progress(valid_tiles, mosaic_path, resolution, n_jobs_mosaic, elevation_clamp=clamp, alaska_5m_strategy=alaska_5m_strategy)
+    # 10m/30m: S3 Direct first (1-2s bucket listing, skips slow ScienceBase API),
+    #          then TNM catalog as fallback if S3 yields nothing.
+    # 1m and others: TNM catalog first (catalog is more precise for project tiles;
+    #                S3 for 1m has to decode 1000+ tile bboxes which is slower).
+
+    if resolution in [10, 30]:
+        # Strategy A2 first for speed — S3 bucket listing beats TNM catalog API
+        logger.info(f"Strategy A2 (S3 Direct): Attempting {resolution}m raw tiles via S3...")
+        s3_tiles = _download_via_s3_direct(aoi_gdf, output_folder, resolution, n_jobs=n_jobs_download)
+        if s3_tiles:
+            mosaic_path = os.path.join(output_folder, f"mosaic_{resolution}m_dem.tif")
+            result = _mosaic_with_progress(s3_tiles, mosaic_path, resolution, n_jobs_mosaic, elevation_clamp=clamp, alaska_5m_strategy=alaska_5m_strategy)
+            if result:
+                logger.info("Strategy A2 succeeded.")
+
+        if not result:
+            logger.info(f"Strategy A (TNM): Attempting {resolution}m via catalog fallback...")
+            valid_tiles = _download_via_source_api(aoi_gdf, output_folder, resolution, n_jobs_download, alaska_5m_strategy)
+            if valid_tiles:
+                mosaic_path = os.path.join(output_folder, f"mosaic_{resolution}m_dem.tif")
+                result = _mosaic_with_progress(valid_tiles, mosaic_path, resolution, n_jobs_mosaic, elevation_clamp=clamp, alaska_5m_strategy=alaska_5m_strategy)
+
+    else:
+        # Strategy A first for 1m/3m/5m — catalog gives precise spatial filtering
+        logger.info(f"Strategy A (TNM): Attempting {resolution}m Project tiles...")
+        valid_tiles = _download_via_source_api(aoi_gdf, output_folder, resolution, n_jobs_download, alaska_5m_strategy)
+        if valid_tiles:
+            mosaic_path = os.path.join(output_folder, f"mosaic_{resolution}m_dem.tif")
+            result = _mosaic_with_progress(valid_tiles, mosaic_path, resolution, n_jobs_mosaic, elevation_clamp=clamp, alaska_5m_strategy=alaska_5m_strategy)
+
+        if not result and resolution == 1:
+            logger.info("Strategy A2 (S3 Direct): Attempting 1m tiles via S3...")
+            s3_tiles = _download_via_s3_direct(aoi_gdf, output_folder, resolution, n_jobs=n_jobs_download)
+            if s3_tiles:
+                mosaic_path = os.path.join(output_folder, f"mosaic_{resolution}m_dem.tif")
+                result = _mosaic_with_progress(s3_tiles, mosaic_path, resolution, n_jobs_mosaic, elevation_clamp=clamp, alaska_5m_strategy=alaska_5m_strategy)
+
+    if not result:
+        logger.warning(f"Primary strategies failed for {resolution}m. Trying WCS and STAC fallbacks...")
+
+        # Strategy B: WCS via py3dep — seamless service, any resolution.
+        if not result:
+            logger.warning(f"Strategy B (WCS): Attempting {resolution}m via py3dep...")
+            valid_tiles = _download_via_wcs(aoi_gdf, output_folder, resolution)
+            if valid_tiles:
+                mosaic_path = os.path.join(output_folder, f"mosaic_{resolution}m_dem.tif")
+                result = _mosaic_with_progress(valid_tiles, mosaic_path, resolution, n_jobs_mosaic, elevation_clamp=clamp, alaska_5m_strategy=alaska_5m_strategy)
+            else:
+                logger.warning("Strategy B (WCS) failed. Trying Planetary Computer STAC...")
+
+        # Strategy C: Planetary Computer STAC — last resort, 10m/30m only.
+        # 3dep-seamless is a smoothed mosaic product; prefer raw tiles and WCS first.
+        if not result and resolution in [10, 30]:
+            logger.info(f"Strategy C (STAC): Attempting {resolution}m via Planetary Computer...")
+            result = _download_via_stac(aoi_gdf, output_folder, resolution, elevation_clamp=clamp)
+            if result:
+                logger.info("Strategy C succeeded.")
+            else:
+                logger.error(f"All strategies (A, A2, B, C) failed for {resolution}m resolution.")
     
     if result:
         logger.info("Validating final mosaic...")
@@ -1228,6 +1664,7 @@ def download_and_mosaic_dems(
             # Safe cleanup with retry logic for Windows
             temp_dirs = [
                 os.path.join(output_folder, "temp_source_tiles"),
+                os.path.join(output_folder, "temp_s3_tiles"),
                 os.path.join(output_folder, "temp_wcs_tiles")
             ]
             
@@ -1257,8 +1694,8 @@ def download_and_mosaic_dems(
                         logger.warning(f"Could not fully remove {os.path.basename(temp_dir)}: {e2}")
                         logger.warning("Leftover files will be cleaned up on next run")
                         
-            return mosaic_path
-            
+            return result
+
     return None
 
 
